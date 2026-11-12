@@ -7,7 +7,7 @@
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   canvas { display: block; }
-  #ui { position: fixed; right: 12px; top: 12px; display: flex; gap: 12px; color: #fffc; font: 12px system-ui, sans-serif; background: #0008; padding: 6px 10px; border-radius: 8px; }
+  #ui { position: fixed; right: 12px; top: 12px; display: flex; flex-wrap: wrap; gap: 10px 12px; max-width: calc(100vw - 48px); color: #fffc; font: 12px system-ui, sans-serif; background: #0008; padding: 6px 10px; border-radius: 8px; }
   #ui select, #ui input { vertical-align: middle; }
   #hint { position: fixed; left: 16px; bottom: 12px; color: #fff8; font: 12px system-ui, sans-serif; pointer-events: none; }
 </style>
@@ -16,9 +16,18 @@
 <div id="hint">Drag to orbit, scroll to zoom</div>
 <div id="ui">
   <label>Disk <input id="bright" type="range" min="0.3" max="2" step="0.05" value="1"></label>
+  <label>Bloom <input id="bloom" type="range" min="0" max="2" step="0.05" value="0.35"></label>
+  <label><input id="kerr" type="checkbox"> Kerr</label>
+  <label>Spin <input id="spin" type="range" min="0.05" max="0.99" step="0.01" value="0.9" disabled></label>
   <label>Quality <select id="quality"><option value="0.5">Low</option><option value="1" selected>Medium</option><option value="1.5">High</option></select></label>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
 <script>
 const renderer = new THREE.WebGLRenderer({ antialias: false });
 renderer.setPixelRatio(1);
@@ -40,7 +49,9 @@ uniform mat3  uRot;
 uniform float uTime;
 uniform float uBright;
 
-const float RIN  = 3.0;   // innermost stable circular orbit (3 rs)
+uniform float uSpin;  // dimensionless spin a/M, 0 = Schwarzschild
+uniform float uRh;    // horizon radius (rs units)
+uniform float uRin;   // innermost stable circular orbit (rs units)
 const float ROUT = 13.0;
 
 float hash(vec2 p){ p = fract(p*vec2(123.34, 456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }
@@ -90,7 +101,7 @@ void main(){
 
   for(int i=0;i<420;i++){
     float r2 = dot(pos,pos), r = sqrt(r2);
-    if(r < 1.0){ captured = true; break; }
+    if(r < uRh){ captured = true; break; }
     if(r > 80.0 && dot(pos,vel) > 0.0) break;
 
     float dt = clamp(0.04*(r-0.7), 0.012, 1.2);
@@ -98,7 +109,11 @@ void main(){
     glow += exp(-abs(r-1.5)*5.0) * dt * 0.12;
 
     vec3 prev = pos;
-    vel += -1.5*h2*pos/(r2*r2*r) * dt;
+    // Schwarzschild bending + gravitomagnetic (Lense-Thirring) frame dragging
+    vec3 J  = vec3(0.0, uSpin*0.25, 0.0);
+    vec3 rh = pos/r;
+    vec3 Bg = (3.0*rh*dot(rh,J) - J)/(r2*r);
+    vel += (-1.5*h2*pos/(r2*r2*r) + 4.0*cross(vel, Bg)) * dt;
     vel = normalize(vel);
     pos += vel*dt;
 
@@ -107,22 +122,22 @@ void main(){
       float t = prev.y/(prev.y-pos.y);
       vec3 p = mix(prev, pos, t);
       float rr = length(p.xz);
-      if(rr > RIN && rr < ROUT){
+      if(rr > uRin && rr < ROUT){
         float phi = atan(p.z, p.x);
         float omega = 3.2 / (rr*sqrt(rr));        // Keplerian shear
         float a = phi + uTime*omega;
         float n = fbm(vec2(rr*1.6, a*3.0 + rr*0.6));
         float rings = 0.65 + 0.35*sin(rr*7.0 + n*5.0);
         float dens = (0.35 + 0.9*n) * rings;
-        dens *= smoothstep(RIN, RIN+0.8, rr) * (1.0 - smoothstep(ROUT-4.0, ROUT, rr));
+        dens *= smoothstep(uRin, uRin+0.8, rr) * (1.0 - smoothstep(ROUT-4.0, ROUT, rr));
 
-        float temp = pow(RIN/rr, 0.75) * 1.15;
+        float temp = pow(uRin/rr, 0.75) * 1.15;
         // relativistic Doppler + beaming
         float vorb = sqrt(0.5/(rr-0.0)) ;                 // v/c ~ sqrt(rs/2r)
         vec3 vdir  = normalize(vec3(-p.z, 0.0, p.x));
         float beta = dot(vdir, -vel) * vorb;
         float D = 1.0/(1.0 - beta);
-        float I = dens * pow(D, 3.0) * (0.6 + 2.2*pow(RIN/rr, 1.5));
+        float I = dens * pow(D, 3.0) * (0.6 + 2.2*pow(uRin/rr, 1.5));
         vec3 c = blackbody(temp*D) * I;
         float a_ = clamp(dens*0.9, 0.0, 0.95);
         col += trans * c * a_;
@@ -149,16 +164,42 @@ const uniforms = {
   uRot:  { value: new THREE.Matrix3() },
   uTime: { value: 0 },
   uBright: { value: 1 },
+  uSpin: { value: 0 },
+  uRh:   { value: 1 },
+  uRin:  { value: 3 },
 };
-let pr = Math.min(window.devicePixelRatio, 1.5);
+
+// Kerr parameters (G = c = 1, M = rs/2): outer horizon and prograde ISCO
+function updateKerr(){
+  const a = document.getElementById('kerr').checked ? +document.getElementById('spin').value : 0;
+  const cb = Math.cbrt;
+  const z1 = 1 + cb(1 - a*a) * (cb(1 + a) + cb(1 - a));
+  const z2 = Math.sqrt(3*a*a + z1*z1);
+  const iscoM = 3 + z2 - Math.sqrt((3 - z1) * (3 + z1 + 2*z2));
+  uniforms.uSpin.value = a;
+  uniforms.uRh.value   = 0.5 * (1 + Math.sqrt(1 - a*a));
+  uniforms.uRin.value  = iscoM / 2;
+  document.getElementById('spin').disabled = !document.getElementById('kerr').checked;
+}
+
+let pr = 1;
 document.getElementById('ui').addEventListener('input', e => {
-  if (e.target.id === 'bright') uniforms.uBright.value = +e.target.value;
-  if (e.target.id === 'quality') { pr = +e.target.value; renderer.setPixelRatio(pr); resize(); }
+  const id = e.target.id;
+  if (id === 'bright') uniforms.uBright.value = +e.target.value;
+  if (id === 'bloom') { bloomPass.strength = +e.target.value; bloomPass.enabled = +e.target.value > 0; }
+  if (id === 'kerr' || id === 'spin') updateKerr();
+  if (id === 'quality') { pr = +e.target.value; renderer.setPixelRatio(pr); composer.setPixelRatio(pr); resize(); }
 });
 scene.add(new THREE.Mesh(
   new THREE.PlaneGeometry(2, 2),
   new THREE.ShaderMaterial({ vertexShader: vert, fragmentShader: frag, uniforms, depthTest: false })
 ));
+
+// Post-processing: bloom
+const composer = new THREE.EffectComposer(renderer);
+composer.addPass(new THREE.RenderPass(scene, ortho));
+const bloomPass = new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.35, 0.6, 0.75);
+composer.addPass(bloomPass);
 
 // Orbit controls (manual)
 let yaw = 0.6, pitch = 0.12, dist = 28, drag = false, lx = 0, ly = 0;
@@ -174,11 +215,11 @@ addEventListener('wheel', e => { dist = Math.max(4, Math.min(80, dist * Math.exp
 
 function resize(){
   renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
   const s = renderer.getPixelRatio();
-  renderer.setSize(innerWidth, innerHeight);
   uniforms.uRes.value.set(innerWidth*s, innerHeight*s);
 }
-addEventListener('resize', resize); resize();
+addEventListener('resize', resize); resize(); updateKerr();
 
 const cam = new THREE.PerspectiveCamera(); // camera lookAt uses -Z, which the shader expects
 const clock = new THREE.Clock();
@@ -193,7 +234,7 @@ const clock = new THREE.Clock();
   uniforms.uCam.value.copy(cam.position);
   uniforms.uRot.value.setFromMatrix4(cam.matrixWorld);
   uniforms.uTime.value = clock.getElapsedTime();
-  renderer.render(scene, ortho);
+  composer.render();
   requestAnimationFrame(loop);
 })();
 </script>
